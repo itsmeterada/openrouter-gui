@@ -7,6 +7,7 @@ from typing import List, Optional, Dict, Any
 from pathlib import Path
 
 import requests
+import keyring
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QTextEdit, QLineEdit, QPushButton, QScrollArea, QLabel, 
@@ -23,8 +24,11 @@ from PyQt6.QtGui import (
     QIcon, QPalette, QColor, QLinearGradient, QPainter
 )
 
-# 設定ファイルのパス
+# 設定ファイルのパス（APIキー以外の設定用）
 CONFIG_FILE = "openrouter_config.json"
+# keyringサービス名
+KEYRING_SERVICE = "OpenRouter-GUI"
+KEYRING_USERNAME = "api_key"
 
 class ConfigDialog(QDialog):
     """API設定ダイアログ"""
@@ -65,21 +69,43 @@ class ConfigDialog(QDialog):
     def load_config(self):
         """設定を読み込み"""
         try:
+            # keyringからAPIキーを取得
+            api_key = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+            if api_key:
+                self.api_key_edit.setText(api_key)
+            
+            # その他の設定をJSONファイルから取得
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
-                self.api_key_edit.setText(config.get('api_key', ''))
                 self.base_url_edit.setText(config.get('base_url', 'https://openrouter.ai/api/v1'))
         except FileNotFoundError:
-            pass
+            self.base_url_edit.setText('https://openrouter.ai/api/v1')
+        except Exception as e:
+            print(f"設定読み込みエラー: {e}")
             
     def save_config(self):
         """設定を保存"""
-        config = {
-            'api_key': self.api_key_edit.text(),
-            'base_url': self.base_url_edit.text()
-        }
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
+        try:
+            # APIキーをkeyringに保存
+            api_key = self.api_key_edit.text()
+            if api_key:
+                keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, api_key)
+            else:
+                # APIキーが空の場合は削除
+                try:
+                    keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
+                except keyring.errors.PasswordDeleteError:
+                    pass
+            
+            # その他の設定をJSONファイルに保存（APIキーは除く）
+            config = {
+                'base_url': self.base_url_edit.text()
+            }
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"設定保存エラー: {e}")
+            raise
 
 class AttachedFile:
     """添付ファイルクラス"""
@@ -373,9 +399,19 @@ class MainWindow(QMainWindow):
     def load_config(self) -> Dict:
         """設定を読み込み"""
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except FileNotFoundError:
+            # keyringからAPIキーを取得
+            api_key = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) or ''
+            
+            # その他の設定をJSONファイルから取得
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    config['api_key'] = api_key  # keyringから取得したAPIキーを追加
+                    return config
+            except FileNotFoundError:
+                return {'api_key': api_key, 'base_url': 'https://openrouter.ai/api/v1'}
+        except Exception as e:
+            print(f"設定読み込みエラー: {e}")
             return {'api_key': '', 'base_url': 'https://openrouter.ai/api/v1'}
             
     def setup_model_list(self):
