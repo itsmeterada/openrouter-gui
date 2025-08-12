@@ -40,7 +40,7 @@ class MarkdownRenderer:
     
     def __init__(self):
         self.formatter = HtmlFormatter(
-            style='github-dark',
+            style='default',
             noclasses=True,
             cssclass='highlight'
         )
@@ -84,22 +84,34 @@ class MarkdownRenderer:
                 margin-bottom: 1em;
             }}
             code {{
-                background-color: #f6f8fa;
-                padding: 0.2em 0.4em;
-                border-radius: 3px;
-                font-size: 85%;
-                font-family: 'SFMono-Regular', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+                background-color: #f8f8f8;
+                color: #e83e8c;
+                padding: 0.2em 0.5em;
+                border-radius: 4px;
+                font-size: 88%;
+                font-family: 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+                border: 1px solid #e1e4e8;
             }}
             pre {{
-                background-color: #f6f8fa;
-                padding: 1em;
-                border-radius: 6px;
+                background-color: #f8f9fa;
+                color: #333;
+                padding: 16px 20px;
+                border-radius: 8px;
                 overflow-x: auto;
-                border-left: 4px solid #0969da;
+                border: 1px solid #e1e4e8;
+                margin: 12px 0;
+                font-size: 14px;
+                line-height: 1.45;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
             }}
             pre code {{
                 background-color: transparent;
+                color: inherit;
                 padding: 0;
+                border: none;
+                border-radius: 0;
+                font-size: inherit;
+                box-shadow: none;
             }}
             blockquote {{
                 border-left: 4px solid #dfe2e5;
@@ -130,11 +142,28 @@ class MarkdownRenderer:
                 margin-bottom: 0.5em;
             }}
             .highlight {{
-                background: #f6f8fa;
-                border-radius: 6px;
-                padding: 1em;
-                border-left: 4px solid #0969da;
+                background: #f8f9fa !important;
+                border-radius: 8px;
+                padding: 16px 20px;
+                border: 1px solid #e1e4e8;
+                margin: 12px 0;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                overflow-x: auto;
             }}
+            .highlight pre {{
+                background: transparent !important;
+                border: none !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                box-shadow: none !important;
+            }}
+            /* シンタックスハイライトの色調整 */
+            .highlight .k {{ color: #d73a49; font-weight: 600; }}  /* キーワード */
+            .highlight .s {{ color: #032f62; }}  /* 文字列 */
+            .highlight .c {{ color: #6a737d; font-style: italic; }}  /* コメント */
+            .highlight .n {{ color: #24292e; }}  /* 名前 */
+            .highlight .o {{ color: #d73a49; }}  /* オペレータ */
+            .highlight .p {{ color: #24292e; }}  /* 句読点 */
         </style>
         <div>{html}</div>
         """
@@ -423,7 +452,15 @@ class ChatBubble(QFrame):
         super().__init__()
         self.is_user = is_user
         self.markdown_renderer = MarkdownRenderer()
+        self.current_message = message
+        self.text_browser = None  # ストリーミング用参照を保持
         self.setup_ui(message, images or [])
+        
+    def update_message(self, new_content: str):
+        """メッセージを更新（ストリーミング用）"""
+        if not self.is_user and self.text_browser:
+            self.current_message += new_content
+            self.text_browser.setHtml(self.markdown_renderer.render_markdown(self.current_message))
         
     def setup_ui(self, message: str, images: List[str]):
         layout = QVBoxLayout()
@@ -456,15 +493,19 @@ class ChatBubble(QFrame):
             layout.addWidget(text_label)
         else:
             # AIメッセージはマークダウンレンダリング
-            text_browser = QTextBrowser()
-            text_browser.setHtml(self.markdown_renderer.render_markdown(message))
-            text_browser.setOpenExternalLinks(True)
-            text_browser.setMaximumHeight(500)  # 最大高さを制限
-            text_browser.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-            text_browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.text_browser = QTextBrowser()
+            self.text_browser.setHtml(self.markdown_renderer.render_markdown(message))
+            self.text_browser.setOpenExternalLinks(True)
+            self.text_browser.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.text_browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            
+            # コンテンツサイズに合わせて高さを自動調整
+            self.text_browser.document().documentLayout().documentSizeChanged.connect(
+                lambda size: self.text_browser.setFixedHeight(int(size.height()))
+            )
             
             # QTextBrowserのスタイルを調整
-            text_browser.setStyleSheet("""
+            self.text_browser.setStyleSheet("""
                 QTextBrowser {
                     background-color: transparent;
                     border: none;
@@ -472,7 +513,7 @@ class ChatBubble(QFrame):
                 }
             """)
             
-            layout.addWidget(text_browser)
+            layout.addWidget(self.text_browser)
         
         self.setLayout(layout)
         
@@ -515,6 +556,7 @@ class ChatBubble(QFrame):
 class OpenRouterAPIThread(QThread):
     """OpenRouter API呼び出しスレッド"""
     message_received = pyqtSignal(str)
+    message_chunk_received = pyqtSignal(str)  # ストリーミング用
     error_occurred = pyqtSignal(str)
     
     def __init__(self, api_key: str, base_url: str, model: str, messages: List[Dict], attached_files: List[AttachedFile]):
@@ -577,23 +619,39 @@ class OpenRouterAPIThread(QThread):
                 "model": self.model,
                 "messages": api_messages,
                 "max_tokens": 2000,
-                "temperature": 0.7
+                "temperature": 0.7,
+                "stream": True
             }
             
             response = requests.post(
                 f"{self.base_url}/chat/completions",
                 headers=headers,
                 json=data,
-                timeout=60
+                timeout=60,
+                stream=True
             )
             
             if response.status_code == 200:
-                result = response.json()
-                if 'choices' in result and len(result['choices']) > 0:
-                    message = result['choices'][0]['message']['content']
-                    self.message_received.emit(message)
-                else:
-                    self.error_occurred.emit("レスポンスが無効です")
+                full_message = ""
+                for line in response.iter_lines():
+                    if line:
+                        line = line.decode('utf-8')
+                        if line.startswith('data: '):
+                            json_str = line[6:]  # 'data: 'を除去
+                            if json_str.strip() == '[DONE]':
+                                break
+                            try:
+                                chunk_data = json.loads(json_str)
+                                if 'choices' in chunk_data and len(chunk_data['choices']) > 0:
+                                    delta = chunk_data['choices'][0].get('delta', {})
+                                    if 'content' in delta:
+                                        content = delta['content']
+                                        full_message += content
+                                        self.message_chunk_received.emit(content)
+                            except json.JSONDecodeError:
+                                continue
+                
+                self.message_received.emit(full_message)  # 完了時に全体メッセージを送信
             else:
                 self.error_occurred.emit(f"API エラー: {response.status_code} - {response.text}")
                 
@@ -611,6 +669,7 @@ class MainWindow(QMainWindow):
         self.messages = []
         self.api_thread = None
         self.config = self.load_config()
+        self.current_ai_bubble = None  # 現在ストリーミング中のAIメッセージバブル
         
         self.setup_ui()
         self.setup_styles()
@@ -1005,6 +1064,10 @@ class MainWindow(QMainWindow):
         for f in current_files:
             print(f"ファイル: {f.file_name}, タイプ: {f.mime_type}, 画像: {f.is_image()}")
         
+        # ストリーミング用のAIメッセージバブルを先に作成
+        self.current_ai_bubble = ChatBubble("", False)
+        self.chat_layout.insertWidget(self.chat_layout.count() - 1, self.current_ai_bubble)
+        
         # API呼び出し（コピーしたファイルを使用）
         self.api_thread = OpenRouterAPIThread(
             self.config['api_key'],
@@ -1014,22 +1077,37 @@ class MainWindow(QMainWindow):
             current_files
         )
         self.api_thread.message_received.connect(self.on_message_received)
+        self.api_thread.message_chunk_received.connect(self.on_message_chunk_received)
         self.api_thread.error_occurred.connect(self.on_error_occurred)
         self.api_thread.start()
         
+    def on_message_chunk_received(self, chunk: str):
+        """ストリーミングチャンク受信時の処理"""
+        if self.current_ai_bubble:
+            self.current_ai_bubble.update_message(chunk)
+            # スクロールを最下部に
+            QTimer.singleShot(10, lambda: self.chat_scroll.verticalScrollBar().setValue(
+                self.chat_scroll.verticalScrollBar().maximum()
+            ))
+    
     def on_message_received(self, message: str):
-        """メッセージ受信時の処理"""
-        self.add_chat_bubble(message, False)
+        """メッセージ受信完了時の処理"""
         self.messages.append({
             'role': 'assistant',
             'content': message
         })
         
+        self.current_ai_bubble = None  # ストリーミング完了
         self.send_btn.setEnabled(True)
         self.progress_bar.hide()
         
     def on_error_occurred(self, error: str):
         """エラー発生時の処理"""
+        # エラー時は作成したAIバブルを削除
+        if self.current_ai_bubble:
+            self.current_ai_bubble.deleteLater()
+            self.current_ai_bubble = None
+        
         QMessageBox.critical(self, "エラー", error)
         self.send_btn.setEnabled(True)
         self.progress_bar.hide()
