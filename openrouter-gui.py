@@ -3,17 +3,22 @@ import os
 import json
 import base64
 import mimetypes
+import re
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 
 import requests
 import keyring
+import markdown
+from pygments import highlight
+from pygments.lexers import get_lexer_by_name, TextLexer
+from pygments.formatters import HtmlFormatter
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QTextEdit, QLineEdit, QPushButton, QScrollArea, QLabel, 
     QFrame, QSplitter, QComboBox, QDialog, QFormLayout, 
     QDialogButtonBox, QMessageBox, QFileDialog, QProgressBar,
-    QListWidget, QListWidgetItem, QMenu, QToolButton
+    QListWidget, QListWidgetItem, QMenu, QToolButton, QTextBrowser
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QMimeData, QUrl, pyqtSlot,
@@ -29,6 +34,185 @@ CONFIG_FILE = "openrouter_config.json"
 # keyringサービス名
 KEYRING_SERVICE = "OpenRouter-GUI"
 KEYRING_USERNAME = "api_key"
+
+class MarkdownRenderer:
+    """マークダウンレンダラー"""
+    
+    def __init__(self):
+        self.formatter = HtmlFormatter(
+            style='github-dark',
+            noclasses=True,
+            cssclass='highlight'
+        )
+        
+    def render_markdown(self, text: str) -> str:
+        """マークダウンテキストをHTMLに変換"""
+        if not text.strip():
+            return ""
+            
+        # コードブロックを事前処理してシンタックスハイライトを適用
+        text = self._process_code_blocks(text)
+        
+        # Markdownを HTMLに変換
+        md = markdown.Markdown(extensions=[
+            'codehilite',
+            'fenced_code', 
+            'tables',
+            'toc'
+        ])
+        
+        html = md.convert(text)
+        
+        # CSSスタイルを追加
+        styled_html = f"""
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+                line-height: 1.6;
+                color: #333;
+                margin: 0;
+                padding: 0;
+            }}
+            h1, h2, h3, h4, h5, h6 {{
+                margin-top: 1.5em;
+                margin-bottom: 0.5em;
+                font-weight: 600;
+            }}
+            h1 {{ border-bottom: 2px solid #eee; padding-bottom: 0.3em; }}
+            h2 {{ border-bottom: 1px solid #eee; padding-bottom: 0.3em; }}
+            p {{
+                margin-bottom: 1em;
+            }}
+            code {{
+                background-color: #f6f8fa;
+                padding: 0.2em 0.4em;
+                border-radius: 3px;
+                font-size: 85%;
+                font-family: 'SFMono-Regular', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+            }}
+            pre {{
+                background-color: #f6f8fa;
+                padding: 1em;
+                border-radius: 6px;
+                overflow-x: auto;
+                border-left: 4px solid #0969da;
+            }}
+            pre code {{
+                background-color: transparent;
+                padding: 0;
+            }}
+            blockquote {{
+                border-left: 4px solid #dfe2e5;
+                padding-left: 1em;
+                margin-left: 0;
+                color: #6a737d;
+            }}
+            table {{
+                border-collapse: collapse;
+                width: 100%;
+                margin: 1em 0;
+            }}
+            table, th, td {{
+                border: 1px solid #dfe2e5;
+            }}
+            th, td {{
+                padding: 0.5em;
+                text-align: left;
+            }}
+            th {{
+                background-color: #f6f8fa;
+                font-weight: 600;
+            }}
+            ul, ol {{
+                padding-left: 2em;
+            }}
+            li {{
+                margin-bottom: 0.5em;
+            }}
+            .highlight {{
+                background: #f6f8fa;
+                border-radius: 6px;
+                padding: 1em;
+                border-left: 4px solid #0969da;
+            }}
+        </style>
+        <div>{html}</div>
+        """
+        
+        return styled_html
+        
+    def _process_code_blocks(self, text: str) -> str:
+        """コードブロックにシンタックスハイライトを適用"""
+        # ``` で囲まれたコードブロックを検出
+        pattern = r'```(\w+)?\n(.*?)\n```'
+        
+        def replace_code_block(match):
+            language = match.group(1) or 'text'
+            code = match.group(2)
+            
+            try:
+                lexer = get_lexer_by_name(language)
+            except:
+                lexer = TextLexer()
+                
+            highlighted = highlight(code, lexer, self.formatter)
+            return highlighted
+            
+        return re.sub(pattern, replace_code_block, text, flags=re.DOTALL)
+
+class CustomModelDialog(QDialog):
+    """カスタムモデル追加ダイアログ"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("カスタムモデルを追加")
+        self.setModal(True)
+        self.resize(450, 300)
+        self.setup_ui()
+        
+    def setup_ui(self):
+        layout = QFormLayout()
+        
+        self.model_id_edit = QLineEdit()
+        self.model_id_edit.setPlaceholderText("例: openai/gpt-4o-mini")
+        
+        self.model_name_edit = QLineEdit()
+        self.model_name_edit.setPlaceholderText("例: GPT-4o Mini - 高品質、低価格")
+        
+        self.description_edit = QTextEdit()
+        self.description_edit.setMaximumHeight(80)
+        self.description_edit.setPlaceholderText("モデルの詳細説明（オプション）")
+        
+        layout.addRow("モデルID:", self.model_id_edit)
+        layout.addRow("表示名:", self.model_name_edit)
+        layout.addRow("説明:", self.description_edit)
+        
+        # ヘルプテキスト
+        help_label = QLabel(
+            "モデルIDはOpenRouterのモデル一覧から正確なIDを入力してください。\n"
+            "例: openai/gpt-4o, anthropic/claude-3.5-sonnet など"
+        )
+        help_label.setStyleSheet("color: #666; font-size: 10px;")
+        help_label.setWordWrap(True)
+        
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | 
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        
+        main_layout = QVBoxLayout()
+        main_layout.addLayout(layout)
+        main_layout.addWidget(help_label)
+        main_layout.addWidget(buttons)
+        self.setLayout(main_layout)
+        
+    def get_model_data(self):
+        return {
+            'id': self.model_id_edit.text().strip(),
+            'name': self.model_name_edit.text().strip(),
+            'description': self.description_edit.toPlainText().strip()
+        }
 
 class ConfigDialog(QDialog):
     """API設定ダイアログ"""
@@ -101,6 +285,14 @@ class ConfigDialog(QDialog):
             config = {
                 'base_url': self.base_url_edit.text()
             }
+            # 既存のカスタムモデルを保持
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    existing_config = json.load(f)
+                    config['custom_models'] = existing_config.get('custom_models', [])
+            except FileNotFoundError:
+                config['custom_models'] = []
+            
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -230,6 +422,7 @@ class ChatBubble(QFrame):
     def __init__(self, message: str, is_user: bool = False, images: List[str] = None):
         super().__init__()
         self.is_user = is_user
+        self.markdown_renderer = MarkdownRenderer()
         self.setup_ui(message, images or [])
         
     def setup_ui(self, message: str, images: List[str]):
@@ -250,15 +443,37 @@ class ChatBubble(QFrame):
                     layout.addWidget(image_label)
         
         # テキスト表示
-        text_label = QLabel(message)
-        text_label.setWordWrap(True)
-        text_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        if self.is_user:
+            # ユーザーメッセージは通常のテキスト表示
+            text_label = QLabel(message)
+            text_label.setWordWrap(True)
+            text_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            
+            font = QFont()
+            font.setPointSize(11)
+            text_label.setFont(font)
+            
+            layout.addWidget(text_label)
+        else:
+            # AIメッセージはマークダウンレンダリング
+            text_browser = QTextBrowser()
+            text_browser.setHtml(self.markdown_renderer.render_markdown(message))
+            text_browser.setOpenExternalLinks(True)
+            text_browser.setMaximumHeight(500)  # 最大高さを制限
+            text_browser.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            text_browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            
+            # QTextBrowserのスタイルを調整
+            text_browser.setStyleSheet("""
+                QTextBrowser {
+                    background-color: transparent;
+                    border: none;
+                    font-size: 11px;
+                }
+            """)
+            
+            layout.addWidget(text_browser)
         
-        font = QFont()
-        font.setPointSize(11)
-        text_label.setFont(font)
-        
-        layout.addWidget(text_label)
         self.setLayout(layout)
         
         # スタイル設定
@@ -290,6 +505,10 @@ class ChatBubble(QFrame):
                 QLabel {
                     color: #333333;
                     background-color: transparent;
+                }
+                QTextBrowser {
+                    background-color: transparent;
+                    border: none;
                 }
             """)
 
@@ -409,13 +628,62 @@ class MainWindow(QMainWindow):
                     config['api_key'] = api_key  # keyringから取得したAPIキーを追加
                     return config
             except FileNotFoundError:
-                return {'api_key': api_key, 'base_url': 'https://openrouter.ai/api/v1'}
+                return {'api_key': api_key, 'base_url': 'https://openrouter.ai/api/v1', 'custom_models': []}
         except Exception as e:
             print(f"設定読み込みエラー: {e}")
-            return {'api_key': '', 'base_url': 'https://openrouter.ai/api/v1'}
+            return {'api_key': '', 'base_url': 'https://openrouter.ai/api/v1', 'custom_models': []}
+    
+    def save_custom_model(self, model_data: Dict):
+        """カスタムモデルを保存"""
+        try:
+            # 設定を読み込み
+            config = self.load_config()
+            if 'custom_models' not in config:
+                config['custom_models'] = []
+            
+            # 同じIDのモデルがあるかチェック
+            existing_model = next((m for m in config['custom_models'] if m['id'] == model_data['id']), None)
+            if existing_model:
+                return False  # 既に存在する
+            
+            # 新しいモデルを追加
+            config['custom_models'].append(model_data)
+            
+            # APIキーを除いて保存
+            save_config = {k: v for k, v in config.items() if k != 'api_key'}
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(save_config, f, ensure_ascii=False, indent=2)
+            
+            return True
+        except Exception as e:
+            print(f"カスタムモデル保存エラー: {e}")
+            return False
+    
+    def remove_custom_model(self, model_id: str):
+        """カスタムモデルを削除"""
+        try:
+            config = self.load_config()
+            if 'custom_models' not in config:
+                return False
+            
+            original_count = len(config['custom_models'])
+            config['custom_models'] = [m for m in config['custom_models'] if m['id'] != model_id]
+            
+            if len(config['custom_models']) < original_count:
+                # APIキーを除いて保存
+                save_config = {k: v for k, v in config.items() if k != 'api_key'}
+                with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(save_config, f, ensure_ascii=False, indent=2)
+                return True
+            return False
+        except Exception as e:
+            print(f"カスタムモデル削除エラー: {e}")
+            return False
             
     def setup_model_list(self):
         """モデルリストを設定"""
+        self.model_combo.clear()
+        
         models = {
             "🔥 おすすめ (Vision対応)": [
                 ("openai/gpt-4o", "GPT-4o - 最新、画像・文書解析"),
@@ -448,6 +716,17 @@ class MainWindow(QMainWindow):
             ]
         }
         
+        # カスタムモデルがあればそれを最初に追加
+        custom_models = self.config.get('custom_models', [])
+        if custom_models:
+            self.model_combo.addItem("────── 🔧 カスタムモデル ──────")
+            separator_index = self.model_combo.count() - 1
+            self.model_combo.model().item(separator_index).setEnabled(False)
+            
+            for model in custom_models:
+                display_name = f"  {model['name']}"
+                self.model_combo.addItem(display_name, f"custom:{model['id']}")
+        
         for category, model_list in models.items():
             self.model_combo.addItem(f"────── {category} ──────")
             # セパレータアイテムは選択不可に
@@ -464,6 +743,9 @@ class MainWindow(QMainWindow):
         """選択されたモデルIDを取得"""
         current_data = self.model_combo.currentData()
         if current_data:
+            # カスタムモデルの場合はプレフィックスを除去
+            if current_data.startswith("custom:"):
+                return current_data[7:]  # "custom:"を除去
             return current_data
         # フォールバック
         return "openai/gpt-4o"
@@ -483,6 +765,13 @@ class MainWindow(QMainWindow):
         self.model_combo = QComboBox()
         self.setup_model_list()
         self.model_combo.setMinimumWidth(250)
+        # カスタムモデルの削除用コンテキストメニュー
+        self.model_combo.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.model_combo.customContextMenuRequested.connect(self.show_model_context_menu)
+        
+        # モデル追加ボタン
+        add_model_btn = QPushButton("➕ モデル追加")
+        add_model_btn.clicked.connect(self.add_custom_model)
         
         # 設定ボタン
         settings_btn = QPushButton("⚙️ 設定")
@@ -494,6 +783,7 @@ class MainWindow(QMainWindow):
         
         toolbar_layout.addWidget(QLabel("モデル:"))
         toolbar_layout.addWidget(self.model_combo)
+        toolbar_layout.addWidget(add_model_btn)
         toolbar_layout.addStretch()
         toolbar_layout.addWidget(settings_btn)
         toolbar_layout.addWidget(clear_btn)
@@ -754,6 +1044,63 @@ class MainWindow(QMainWindow):
                 
         self.messages.clear()
         QMessageBox.information(self, "クリア", "チャット履歴がクリアされました。")
+    
+    def add_custom_model(self):
+        """カスタムモデル追加"""
+        dialog = CustomModelDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            model_data = dialog.get_model_data()
+            
+            # 入力検証
+            if not model_data['id'] or not model_data['name']:
+                QMessageBox.warning(self, "エラー", "モデルIDと表示名は必須です。")
+                return
+            
+            # モデルを保存
+            if self.save_custom_model(model_data):
+                # 設定を再読み込み
+                self.config = self.load_config()
+                # モデルリストを更新
+                current_text = self.model_combo.currentText()
+                self.setup_model_list()
+                # 可能であれば元の選択を復元
+                index = self.model_combo.findText(current_text)
+                if index >= 0:
+                    self.model_combo.setCurrentIndex(index)
+                
+                QMessageBox.information(self, "成功", f"カスタムモデル '{model_data['name']}' が追加されました。")
+            else:
+                QMessageBox.warning(self, "エラー", "同じIDのモデルが既に存在するか、保存に失敗しました。")
+    
+    def show_model_context_menu(self, position):
+        """モデル選択のコンテキストメニュー"""
+        current_data = self.model_combo.currentData()
+        if current_data and current_data.startswith("custom:"):
+            menu = QMenu(self)
+            delete_action = menu.addAction("削除")
+            
+            action = menu.exec(self.model_combo.mapToGlobal(position))
+            if action == delete_action:
+                model_id = current_data[7:]  # "custom:"を除去
+                self.delete_custom_model(model_id)
+    
+    def delete_custom_model(self, model_id: str):
+        """カスタムモデルを削除"""
+        reply = QMessageBox.question(
+            self, "確認", 
+            f"カスタムモデル '{model_id}' を削除しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            if self.remove_custom_model(model_id):
+                # 設定を再読み込み
+                self.config = self.load_config()
+                # モデルリストを更新
+                self.setup_model_list()
+                QMessageBox.information(self, "成功", "カスタムモデルが削除されました。")
+            else:
+                QMessageBox.warning(self, "エラー", "カスタムモデルの削除に失敗しました。")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
