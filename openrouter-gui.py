@@ -34,6 +34,8 @@ CONFIG_FILE = "openrouter_config.json"
 # keyringサービス名
 KEYRING_SERVICE = "OpenRouter-GUI"
 KEYRING_USERNAME = "api_key"
+# モデル情報キャッシュファイル
+MODEL_CACHE_FILE = "model_cache.json"
 
 class MarkdownRenderer:
     """マークダウンレンダラー"""
@@ -188,6 +190,135 @@ class MarkdownRenderer:
             return highlighted
             
         return re.sub(pattern, replace_code_block, text, flags=re.DOTALL)
+
+class ModelInfoManager:
+    """モデル情報管理クラス"""
+    
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key
+        self.cache = self.load_cache()
+        
+    def load_cache(self) -> Dict:
+        """キャッシュを読み込み"""
+        try:
+            with open(MODEL_CACHE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            print(f"モデルキャッシュ読み込みエラー: {e}")
+            return {}
+    
+    def save_cache(self):
+        """キャッシュを保存"""
+        try:
+            with open(MODEL_CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"モデルキャッシュ保存エラー: {e}")
+    
+    def get_model_info(self, model_id: str) -> Dict:
+        """モデル情報を取得（キャッシュ優先）"""
+        # キャッシュから確認
+        if model_id in self.cache:
+            cached_info = self.cache[model_id]
+            # キャッシュが1週間以内なら使用
+            import time
+            if time.time() - cached_info.get('cached_at', 0) < 7 * 24 * 3600:
+                return cached_info.get('info', {})
+        
+        # APIから取得
+        return self._fetch_model_info(model_id)
+    
+    def _fetch_model_info(self, model_id: str) -> Dict:
+        """OpenRouter APIからモデル情報を取得"""
+        try:
+            if not self.api_key:
+                return self._get_default_model_info(model_id)
+                
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.get(
+                "https://openrouter.ai/api/v1/models",
+                headers=headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                models_data = response.json()
+                for model in models_data.get('data', []):
+                    if model.get('id') == model_id:
+                        model_info = self._process_model_info(model)
+                        
+                        # キャッシュに保存
+                        import time
+                        self.cache[model_id] = {
+                            'info': model_info,
+                            'cached_at': time.time()
+                        }
+                        self.save_cache()
+                        
+                        return model_info
+            
+            # モデルが見つからない場合はデフォルト情報を返す
+            return self._get_default_model_info(model_id)
+            
+        except Exception as e:
+            print(f"モデル情報取得エラー: {e}")
+            return self._get_default_model_info(model_id)
+    
+    def _process_model_info(self, model_data: Dict) -> Dict:
+        """APIレスポンスからモデル情報を処理"""
+        pricing = model_data.get('pricing', {})
+        
+        # 入力タイプを推定
+        input_types = ['text']
+        model_name = model_data.get('name', '').lower()
+        model_id = model_data.get('id', '').lower()
+        
+        # Vision対応モデルを検出
+        vision_keywords = ['vision', 'gpt-4o', 'claude-3', 'gemini', 'qwen-vl', 'pixtral', 'llama-3.2-90b-vision', 'phi-3.5-vision']
+        if any(keyword in model_name or keyword in model_id for keyword in vision_keywords):
+            input_types.append('image')
+        
+        return {
+            'name': model_data.get('name', model_data.get('id', '')),
+            'description': model_data.get('description', ''),
+            'input_types': input_types,
+            'context_length': model_data.get('context_length', 'Unknown'),
+            'pricing_input': pricing.get('prompt', 'Unknown'),
+            'pricing_output': pricing.get('completion', 'Unknown'),
+            'top_provider': model_data.get('top_provider', {}).get('name', 'Unknown')
+        }
+    
+    def _get_default_model_info(self, model_id: str) -> Dict:
+        """デフォルトのモデル情報を返す"""
+        # よく知られたモデルのデフォルト情報
+        default_info = {
+            'name': model_id,
+            'description': 'モデル情報を取得中...',
+            'input_types': ['text'],
+            'context_length': 'Unknown',
+            'pricing_input': 'Unknown',
+            'pricing_output': 'Unknown',
+            'top_provider': 'Unknown'
+        }
+        
+        # Vision対応モデルの判定
+        vision_models = [
+            'gpt-4o', 'gpt-4-vision', 'claude-3.5-sonnet', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku',
+            'gemini-pro-1.5', 'gemini-flash-1.5', 'qwen-2-vl', 'pixtral', 'llama-3.2-90b-vision', 'phi-3.5-vision'
+        ]
+        
+        for vision_model in vision_models:
+            if vision_model in model_id.lower():
+                default_info['input_types'].append('image')
+                break
+                
+        return default_info
 
 class CustomModelDialog(QDialog):
     """カスタムモデル追加ダイアログ"""
@@ -521,35 +652,43 @@ class ChatBubble(QFrame):
         if self.is_user:
             self.setStyleSheet("""
                 QFrame {
-                    background-color: #007AFF;
-                    border-radius: 15px;
-                    margin-left: 50px;
-                    margin-right: 10px;
-                    margin-top: 5px;
-                    margin-bottom: 5px;
+                    background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                        stop: 0 #667eea, stop: 1 #764ba2);
+                    border-radius: 18px;
+                    margin-left: 60px;
+                    margin-right: 15px;
+                    margin-top: 8px;
+                    margin-bottom: 8px;
+                    border: 2px solid rgba(255, 255, 255, 0.3);
                 }
                 QLabel {
                     color: white;
                     background-color: transparent;
+                    font-weight: 500;
                 }
             """)
         else:
             self.setStyleSheet("""
                 QFrame {
-                    background-color: #F0F0F0;
-                    border-radius: 15px;
-                    margin-left: 10px;
-                    margin-right: 50px;
-                    margin-top: 5px;
-                    margin-bottom: 5px;
+                    background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                        stop: 0 #ffffff, stop: 1 #f7fafc);
+                    border-radius: 18px;
+                    margin-left: 15px;
+                    margin-right: 60px;
+                    margin-top: 8px;
+                    margin-bottom: 8px;
+                    border: 2px solid #e2e8f0;
+                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
                 }
                 QLabel {
-                    color: #333333;
+                    color: #2d3748;
                     background-color: transparent;
+                    font-weight: 500;
                 }
                 QTextBrowser {
                     background-color: transparent;
                     border: none;
+                    color: #2d3748;
                 }
             """)
 
@@ -670,9 +809,15 @@ class MainWindow(QMainWindow):
         self.api_thread = None
         self.config = self.load_config()
         self.current_ai_bubble = None  # 現在ストリーミング中のAIメッセージバブル
+        self.model_info_manager = ModelInfoManager(self.config.get('api_key'))
         
         self.setup_ui()
         self.setup_styles()
+        
+        # UI セットアップ完了後に初期モデル情報を表示
+        current_model = self.get_selected_model()
+        if current_model:
+            self.update_model_info_display(current_model)
         
     def load_config(self) -> Dict:
         """設定を読み込み"""
@@ -687,10 +832,20 @@ class MainWindow(QMainWindow):
                     config['api_key'] = api_key  # keyringから取得したAPIキーを追加
                     return config
             except FileNotFoundError:
-                return {'api_key': api_key, 'base_url': 'https://openrouter.ai/api/v1', 'custom_models': []}
+                return {
+                    'api_key': api_key, 
+                    'base_url': 'https://openrouter.ai/api/v1', 
+                    'custom_models': [],
+                    'last_selected_model': None
+                }
         except Exception as e:
             print(f"設定読み込みエラー: {e}")
-            return {'api_key': '', 'base_url': 'https://openrouter.ai/api/v1', 'custom_models': []}
+            return {
+                'api_key': '', 
+                'base_url': 'https://openrouter.ai/api/v1', 
+                'custom_models': [],
+                'last_selected_model': None
+            }
     
     def save_custom_model(self, model_data: Dict):
         """カスタムモデルを保存"""
@@ -738,6 +893,19 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"カスタムモデル削除エラー: {e}")
             return False
+    
+    def save_last_selected_model(self, model_id: str):
+        """最後に選択したモデルを保存"""
+        try:
+            config = self.load_config()
+            config['last_selected_model'] = model_id
+            
+            # APIキーを除いて保存
+            save_config = {k: v for k, v in config.items() if k != 'api_key'}
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(save_config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"最後に選択したモデル保存エラー: {e}")
             
     def setup_model_list(self):
         """モデルリストを設定"""
@@ -795,8 +963,32 @@ class MainWindow(QMainWindow):
             for model_id, description in model_list:
                 self.model_combo.addItem(f"  {description}", model_id)
         
-        # デフォルト選択
-        self.model_combo.setCurrentText("  GPT-4o - 最新、画像・文書解析")
+        # 最後に選択したモデルを復元、なければデフォルト選択
+        last_selected_model = self.config.get('last_selected_model')
+        if last_selected_model:
+            # モデルIDに対応する表示テキストを検索
+            for i in range(self.model_combo.count()):
+                item_data = self.model_combo.itemData(i)
+                if item_data:
+                    # カスタムモデルの場合
+                    if item_data.startswith("custom:") and item_data[7:] == last_selected_model:
+                        self.model_combo.setCurrentIndex(i)
+                        break
+                    # 通常のモデルの場合
+                    elif item_data == last_selected_model:
+                        self.model_combo.setCurrentIndex(i)
+                        break
+            else:
+                # 見つからない場合はデフォルト選択
+                self.model_combo.setCurrentText("  GPT-4o - 最新、画像・文書解析")
+        else:
+            # 設定がない場合はデフォルト選択
+            self.model_combo.setCurrentText("  GPT-4o - 最新、画像・文書解析")
+        
+        # 初期モデル情報を表示（UIがセットアップされた後）
+        current_model = self.get_selected_model()
+        if current_model and hasattr(self, 'model_info_label'):
+            self.update_model_info_display(current_model)
         
     def get_selected_model(self) -> str:
         """選択されたモデルIDを取得"""
@@ -827,6 +1019,8 @@ class MainWindow(QMainWindow):
         # カスタムモデルの削除用コンテキストメニュー
         self.model_combo.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.model_combo.customContextMenuRequested.connect(self.show_model_context_menu)
+        # モデル変更時の自動保存
+        self.model_combo.currentTextChanged.connect(self.on_model_changed)
         
         # モデル追加ボタン
         add_model_btn = QPushButton("➕ モデル追加")
@@ -843,6 +1037,22 @@ class MainWindow(QMainWindow):
         toolbar_layout.addWidget(QLabel("モデル:"))
         toolbar_layout.addWidget(self.model_combo)
         toolbar_layout.addWidget(add_model_btn)
+        
+        # モデル情報表示ラベル
+        self.model_info_label = QLabel("")
+        self.model_info_label.setStyleSheet("""
+            QLabel {
+                color: #667eea;
+                font-size: 11px;
+                font-weight: 500;
+                padding: 4px 8px;
+                background-color: rgba(102, 126, 234, 0.1);
+                border-radius: 6px;
+                margin-left: 8px;
+            }
+        """)
+        toolbar_layout.addWidget(self.model_info_label)
+        
         toolbar_layout.addStretch()
         toolbar_layout.addWidget(settings_btn)
         toolbar_layout.addWidget(clear_btn)
@@ -921,49 +1131,149 @@ class MainWindow(QMainWindow):
         """スタイル設定"""
         self.setStyleSheet("""
             QMainWindow {
-                background-color: #FFFFFF;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #f8f9ff, stop: 1 #e6f3ff);
             }
             QTextEdit {
-                border: 2px solid #E0E0E0;
-                border-radius: 10px;
-                padding: 10px;
-                font-size: 12px;
-                background-color: #FAFAFA;
+                border: 2px solid #d1d9ff;
+                border-radius: 12px;
+                padding: 12px;
+                font-size: 13px;
+                background-color: #ffffff;
+                color: #2d3748;
             }
             QTextEdit:focus {
-                border-color: #007AFF;
+                border-color: #667eea;
+                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
             }
             QPushButton {
-                background-color: #007AFF;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #667eea, stop: 1 #764ba2);
                 color: white;
                 border: none;
-                border-radius: 8px;
-                padding: 10px 20px;
-                font-weight: bold;
-                font-size: 12px;
+                border-radius: 10px;
+                padding: 12px 24px;
+                font-weight: 600;
+                font-size: 13px;
+                min-height: 20px;
             }
             QPushButton:hover {
-                background-color: #0056CC;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #5a67d8, stop: 1 #6b46c1);
+                transform: translateY(-1px);
             }
             QPushButton:pressed {
-                background-color: #004499;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #553c9a, stop: 1 #5b21b6);
             }
             QComboBox {
-                border: 2px solid #E0E0E0;
-                border-radius: 8px;
-                padding: 8px;
-                background-color: white;
+                border: 2px solid #d1d9ff;
+                border-radius: 10px;
+                padding: 8px 12px;
+                background-color: #ffffff;
+                color: #2d3748;
+                font-size: 13px;
+                font-weight: 500;
+                min-height: 20px;
+            }
+            QComboBox:hover {
+                border-color: #667eea;
+                background-color: #f7fafc;
+            }
+            QComboBox:focus {
+                border-color: #667eea;
+                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+            }
+            QComboBox::drop-down {
+                border: none;
+                border-top-right-radius: 10px;
+                border-bottom-right-radius: 10px;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #667eea, stop: 1 #764ba2);
+                width: 30px;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border: 4px solid transparent;
+                border-top: 6px solid white;
+                margin: 0 8px;
+            }
+            QComboBox QAbstractItemView {
+                border: 2px solid #d1d9ff;
+                border-radius: 10px;
+                background-color: #ffffff;
+                selection-background-color: #667eea;
+                selection-color: white;
+                color: #2d3748;
+                font-size: 13px;
+                padding: 4px;
+                outline: none;
+            }
+            QComboBox QAbstractItemView::item {
+                border: none;
+                padding: 8px 12px;
+                margin: 2px;
+                border-radius: 6px;
+                min-height: 20px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background-color: #e6f3ff;
+                color: #2d3748;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #667eea, stop: 1 #764ba2);
+                color: white;
+                font-weight: 600;
+            }
+            QComboBox QAbstractItemView::item:disabled {
+                color: #a0aec0;
+                background-color: transparent;
+                font-style: italic;
             }
             QScrollArea {
-                border: 1px solid #E0E0E0;
-                border-radius: 10px;
-                background-color: white;
+                border: 2px solid #d1d9ff;
+                border-radius: 12px;
+                background-color: #ffffff;
             }
             QListWidget {
-                border: 2px solid #E0E0E0;
+                border: 2px solid #d1d9ff;
+                border-radius: 10px;
+                background-color: #f7fafc;
+                alternate-background-color: #ffffff;
+                color: #2d3748;
+                font-size: 12px;
+            }
+            QListWidget::item {
+                padding: 8px;
+                border-radius: 6px;
+                margin: 2px;
+            }
+            QListWidget::item:hover {
+                background-color: #e6f3ff;
+            }
+            QListWidget::item:selected {
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #667eea, stop: 1 #764ba2);
+                color: white;
+            }
+            QLabel {
+                color: #2d3748;
+                font-weight: 500;
+            }
+            QProgressBar {
+                border: 2px solid #d1d9ff;
                 border-radius: 8px;
-                background-color: #F8F8F8;
-                alternate-background-color: #FFFFFF;
+                background-color: #f7fafc;
+                text-align: center;
+                font-weight: 600;
+                color: #2d3748;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #667eea, stop: 1 #764ba2);
+                border-radius: 6px;
+                margin: 2px;
             }
         """)
         
@@ -997,6 +1307,8 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             dialog.save_config()
             self.config = self.load_config()
+            # ModelInfoManagerを更新
+            self.model_info_manager = ModelInfoManager(self.config.get('api_key'))
             QMessageBox.information(self, "設定", "設定が保存されました。")
             
     def add_file_dialog(self):
@@ -1179,6 +1491,50 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "成功", "カスタムモデルが削除されました。")
             else:
                 QMessageBox.warning(self, "エラー", "カスタムモデルの削除に失敗しました。")
+    
+    def on_model_changed(self):
+        """モデル変更時の処理"""
+        current_model = self.get_selected_model()
+        if current_model:
+            self.save_last_selected_model(current_model)
+            self.update_model_info_display(current_model)
+    
+    def update_model_info_display(self, model_id: str):
+        """モデル情報表示を更新"""
+        # ラベルが存在することを確認
+        if not hasattr(self, 'model_info_label'):
+            return
+            
+        try:
+            model_info = self.model_info_manager.get_model_info(model_id)
+            input_types = model_info.get('input_types', ['text'])
+            
+            # 入力タイプのアイコンを作成
+            type_icons = []
+            if 'text' in input_types:
+                type_icons.append('📝')
+            if 'image' in input_types:
+                type_icons.append('🖼️')
+            if 'audio' in input_types:
+                type_icons.append('🎵')
+            if 'video' in input_types:
+                type_icons.append('🎥')
+            
+            # 表示テキストを作成
+            if len(type_icons) > 1:
+                info_text = f"{''.join(type_icons)} テキスト・画像対応"
+            else:
+                info_text = f"{''.join(type_icons)} テキストのみ"
+            
+            self.model_info_label.setText(info_text)
+            self.model_info_label.setToolTip(f"モデル: {model_info.get('name', model_id)}\n"
+                                            f"対応入力: {', '.join(input_types)}\n"
+                                            f"コンテキスト長: {model_info.get('context_length', 'Unknown')}")
+            
+        except Exception as e:
+            print(f"モデル情報表示エラー: {e}")
+            self.model_info_label.setText("📝 テキストのみ")
+            self.model_info_label.setToolTip("モデル情報を取得できませんでした")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
