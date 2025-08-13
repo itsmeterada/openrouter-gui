@@ -104,7 +104,6 @@ class MarkdownRenderer:
                 margin: 12px 0;
                 font-size: 14px;
                 line-height: 1.45;
-                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
             }}
             pre code {{
                 background-color: transparent;
@@ -149,7 +148,6 @@ class MarkdownRenderer:
                 padding: 16px 20px;
                 border: 1px solid #e1e4e8;
                 margin: 12px 0;
-                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
                 overflow-x: auto;
             }}
             .highlight pre {{
@@ -157,7 +155,6 @@ class MarkdownRenderer:
                 border: none !important;
                 margin: 0 !important;
                 padding: 0 !important;
-                box-shadow: none !important;
             }}
             /* シンタックスハイライトの色調整 */
             .highlight .k {{ color: #d73a49; font-weight: 600; }}  /* キーワード */
@@ -591,7 +588,17 @@ class ChatBubble(QFrame):
         """メッセージを更新（ストリーミング用）"""
         if not self.is_user and self.text_browser:
             self.current_message += new_content
-            self.text_browser.setHtml(self.markdown_renderer.render_markdown(self.current_message))
+            try:
+                # HTMLを更新してカーソルを最後に移動
+                self.text_browser.setHtml(self.markdown_renderer.render_markdown(self.current_message))
+                # カーソルを文書の最後に移動
+                cursor = self.text_browser.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                self.text_browser.setTextCursor(cursor)
+            except Exception as e:
+                print(f"テキストブラウザ更新エラー: {e}")
+                # エラー時は安全にプレーンテキストで表示
+                self.text_browser.setPlainText(self.current_message)
         
     def setup_ui(self, message: str, images: List[str]):
         layout = QVBoxLayout()
@@ -678,7 +685,6 @@ class ChatBubble(QFrame):
                     margin-top: 8px;
                     margin-bottom: 8px;
                     border: 2px solid #e2e8f0;
-                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
                 }
                 QLabel {
                     color: #2d3748;
@@ -705,9 +711,14 @@ class OpenRouterAPIThread(QThread):
         self.model = model
         self.messages = messages
         self.attached_files = attached_files
+        self._stop_requested = False
+        self._response = None
         
     def run(self):
         try:
+            if self._stop_requested:
+                return
+                
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json"
@@ -762,17 +773,23 @@ class OpenRouterAPIThread(QThread):
                 "stream": True
             }
             
-            response = requests.post(
+            if self._stop_requested:
+                return
+                
+            self._response = requests.post(
                 f"{self.base_url}/chat/completions",
                 headers=headers,
                 json=data,
                 timeout=60,
                 stream=True
             )
+            response = self._response
             
             if response.status_code == 200:
                 full_message = ""
                 for line in response.iter_lines():
+                    if self._stop_requested:
+                        break
                     if line:
                         line = line.decode('utf-8')
                         if line.startswith('data: '):
@@ -790,12 +807,24 @@ class OpenRouterAPIThread(QThread):
                             except json.JSONDecodeError:
                                 continue
                 
-                self.message_received.emit(full_message)  # 完了時に全体メッセージを送信
+                if not self._stop_requested:
+                    self.message_received.emit(full_message)  # 完了時に全体メッセージを送信
             else:
-                self.error_occurred.emit(f"API エラー: {response.status_code} - {response.text}")
+                if not self._stop_requested:
+                    self.error_occurred.emit(f"API エラー: {response.status_code} - {response.text}")
                 
         except Exception as e:
-            self.error_occurred.emit(f"エラーが発生しました: {str(e)}")
+            if not self._stop_requested:
+                self.error_occurred.emit(f"エラーが発生しました: {str(e)}")
+    
+    def stop(self):
+        """推論を停止"""
+        self._stop_requested = True
+        if self._response:
+            try:
+                self._response.close()
+            except:
+                pass
 
 class MainWindow(QMainWindow):
     """メインウィンドウ"""
@@ -1098,6 +1127,13 @@ class MainWindow(QMainWindow):
         self.send_btn.setMinimumHeight(50)
         self.send_btn.clicked.connect(self.send_message)
         
+        # 停止ボタン
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setMinimumHeight(50)
+        self.stop_btn.setObjectName("stop_btn")
+        self.stop_btn.clicked.connect(self.stop_inference)
+        self.stop_btn.hide()  # 初期状態では非表示
+        
         # ファイル追加ボタン
         file_btn = QPushButton("📎 ファイル")
         file_btn.setMaximumWidth(80)
@@ -1106,6 +1142,7 @@ class MainWindow(QMainWindow):
         text_input_layout.addWidget(self.text_input)
         text_input_layout.addWidget(file_btn)
         text_input_layout.addWidget(self.send_btn)
+        text_input_layout.addWidget(self.stop_btn)
         
         input_layout.addLayout(text_input_layout)
         input_frame.setLayout(input_layout)
@@ -1144,7 +1181,6 @@ class MainWindow(QMainWindow):
             }
             QTextEdit:focus {
                 border-color: #667eea;
-                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
             }
             QPushButton {
                 background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
@@ -1160,11 +1196,22 @@ class MainWindow(QMainWindow):
             QPushButton:hover {
                 background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
                     stop: 0 #5a67d8, stop: 1 #6b46c1);
-                transform: translateY(-1px);
             }
             QPushButton:pressed {
                 background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
                     stop: 0 #553c9a, stop: 1 #5b21b6);
+            }
+            QPushButton[objectName="stop_btn"] {
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #e53e3e, stop: 1 #c53030);
+            }
+            QPushButton[objectName="stop_btn"]:hover {
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #fc8181, stop: 1 #e53e3e);
+            }
+            QPushButton[objectName="stop_btn"]:pressed {
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #c53030, stop: 1 #9c2a2a);
             }
             QComboBox {
                 border: 2px solid #d1d9ff;
@@ -1182,7 +1229,6 @@ class MainWindow(QMainWindow):
             }
             QComboBox:focus {
                 border-color: #667eea;
-                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
             }
             QComboBox::drop-down {
                 border: none;
@@ -1364,7 +1410,8 @@ class MainWindow(QMainWindow):
         
         # UI更新
         self.text_input.clear()
-        self.send_btn.setEnabled(False)
+        self.send_btn.hide()
+        self.stop_btn.show()
         self.progress_bar.show()
         self.progress_bar.setRange(0, 0)  # インフィニットプログレス
         
@@ -1410,7 +1457,8 @@ class MainWindow(QMainWindow):
         })
         
         self.current_ai_bubble = None  # ストリーミング完了
-        self.send_btn.setEnabled(True)
+        self.stop_btn.hide()
+        self.send_btn.show()
         self.progress_bar.hide()
         
     def on_error_occurred(self, error: str):
@@ -1421,7 +1469,8 @@ class MainWindow(QMainWindow):
             self.current_ai_bubble = None
         
         QMessageBox.critical(self, "エラー", error)
-        self.send_btn.setEnabled(True)
+        self.stop_btn.hide()
+        self.send_btn.show()
         self.progress_bar.hide()
         
     def clear_chat(self):
@@ -1535,6 +1584,22 @@ class MainWindow(QMainWindow):
             print(f"モデル情報表示エラー: {e}")
             self.model_info_label.setText("📝 テキストのみ")
             self.model_info_label.setToolTip("モデル情報を取得できませんでした")
+    
+    def stop_inference(self):
+        """推論を停止"""
+        if self.api_thread and self.api_thread.isRunning():
+            self.api_thread.stop()
+            self.api_thread.wait(1000)  # 1秒待機
+            
+            # 現在のAIバブルを削除
+            if self.current_ai_bubble:
+                self.current_ai_bubble.deleteLater()
+                self.current_ai_bubble = None
+            
+            # UIを元に戻す
+            self.stop_btn.hide()
+            self.send_btn.show()
+            self.progress_bar.hide()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
